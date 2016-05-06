@@ -59,6 +59,8 @@ extern int AX_MicroP_IsP01Connected(void);
 #include <linux/microp_api.h>
 #endif
 
+#elif CONFIG_SUPPORT_MIPI_HX8379A_DISPLAY
+static int firstNeedReset = 1;
 #endif
 /*	ASUS_BSP: Louis ---	*/
 
@@ -1885,6 +1887,15 @@ static IMG_BOOL ProcessFlip2(IMG_HANDLE hCmdCookie,
 	dev = psDevInfo->psDrmDevice;
 	dev_priv =
 		(struct drm_psb_private *)psDevInfo->psDrmDevice->dev_private;
+
+#ifdef CONFIG_SUPPORT_MIPI_HX8379A_DISPLAY
+	if(firstNeedReset) {
+		printk("[DISPLAY] schedule reset panel workqueue.\n");
+		schedule_work(&dev_priv->reset_panel_work);
+		firstNeedReset = 0;
+		msleep(100);
+	}
+#endif
 
 	/*verify private data*/
 	if (!psFlipCmd->pvPrivData ||

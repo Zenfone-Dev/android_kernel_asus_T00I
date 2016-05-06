@@ -138,6 +138,9 @@ endif
 ifeq ($(CONFIG_SUPPORT_OTM8018B_MIPI_480X854_DISPLAY), y)
 $(DRIVER_NAME)-objs += $(DISPLAYDIR)/pf450cl_vid.o
 endif
+ifeq ($(CONFIG_SUPPORT_MIPI_HX8379A_DISPLAY), y)
+$(DRIVER_NAME)-objs += $(DISPLAYDIR)/hx8379a_vid.o
+endif
 ifeq ($(CONFIG_SUPPORT_TMD_MIPI_600X1024_DISPLAY), y)
 $(DRIVER_NAME)-objs += $(DISPLAYDIR)/tmd_6x10_vid.o
 endif

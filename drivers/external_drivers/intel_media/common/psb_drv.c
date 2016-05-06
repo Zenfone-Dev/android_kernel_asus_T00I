@@ -47,6 +47,8 @@
 //ASUS_BSP: [DDS] +++
 #ifdef CONFIG_SUPPORT_DDS_MIPI_SWITCH
 #include "mdfld_dsi_dpi.h"
+#elif CONFIG_SUPPORT_MIPI_HX8379A_DISPLAY
+#include "mdfld_dsi_dpi.h"
 #endif
 //ASUS_BSP: [DDS] ---
 
@@ -127,7 +129,7 @@ int hpd = 0;
 int panel_turn_on = DDS_NONE;
 #endif
 
-#ifdef CONFIG_SUPPORT_OTM8018B_MIPI_480X854_DISPLAY
+#if defined(CONFIG_SUPPORT_OTM8018B_MIPI_480X854_DISPLAY)||defined(CONFIG_SUPPORT_MIPI_HX8379A_DISPLAY)
 bool esd_thread_enable = true;
 #endif
 
@@ -157,6 +159,9 @@ extern struct platform_driver tmd_lcd_driver;
 
 #ifdef CONFIG_SUPPORT_OTM8018B_MIPI_480X854_DISPLAY
 extern struct platform_driver pf450cl_vid_lcd_driver;
+#endif
+#ifdef CONFIG_SUPPORT_MIPI_HX8379A_DISPLAY
+extern struct platform_driver hx8379a_vid_lcd_driver;
 #endif
 
 static int psb_probe(struct pci_dev *pdev, const struct pci_device_id *ent);
@@ -242,7 +247,7 @@ module_param_named(hpd, hpd, int, 0644);
 module_param_named(panel_turn_on, panel_turn_on, int, 0644);
 #endif
 //ASUS_BSP: [DDS] ---
-#ifdef CONFIG_SUPPORT_OTM8018B_MIPI_480X854_DISPLAY
+#if defined(CONFIG_SUPPORT_OTM8018B_MIPI_480X854_DISPLAY)||defined(CONFIG_SUPPORT_MIPI_HX8379A_DISPLAY)
 module_param_named(esd_thread_enable, esd_thread_enable, bool, 0644);
 #endif
 
@@ -1893,6 +1898,9 @@ static int psb_driver_load(struct drm_device *dev, unsigned long chipset)
 		}
 //ASUS_BSP: [DDS] +++
 #ifdef CONFIG_SUPPORT_DDS_MIPI_SWITCH
+		INIT_WORK(&dev_priv->reset_panel_work,
+				mdfld_reset_same_dpi_panel_work);
+#elif CONFIG_SUPPORT_MIPI_HX8379A_DISPLAY
 		INIT_WORK(&dev_priv->reset_panel_work,
 				mdfld_reset_same_dpi_panel_work);
 #else
@@ -5191,6 +5199,9 @@ static int __init psb_init(void)
 
 #ifdef CONFIG_SUPPORT_OTM8018B_MIPI_480X854_DISPLAY
     ret = platform_driver_register(&pf450cl_vid_lcd_driver);
+#endif
+#ifdef CONFIG_SUPPORT_MIPI_HX8379A_DISPLAY
+	ret = platform_driver_register(&hx8379a_vid_lcd_driver);
 #endif
 	return ret;
 }

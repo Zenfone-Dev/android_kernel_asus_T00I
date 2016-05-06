@@ -142,6 +142,9 @@ void release_ospm_lock(void);
 #ifdef CONFIG_SUPPORT_DDS_MIPI_SWITCH
 void ospm_resume_display(struct pci_dev *pdev);
 void ospm_suspend_display(struct drm_device *dev);
+#elif CONFIG_SUPPORT_MIPI_HX8379A_DISPLAY
+void ospm_resume_display(struct pci_dev *pdev);
+void ospm_suspend_display(struct drm_device *dev);
 #endif
 //ASUS_BSP: [DDS] ---
 

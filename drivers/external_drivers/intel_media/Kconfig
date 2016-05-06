@@ -150,6 +150,13 @@ config SUPPORT_DDS_MIPI_SWITCH
         help
           xxxxxx
 
+config SUPPORT_MIPI_HX8379A_DISPLAY
+       bool "Support CONFIG_SUPPORT_MIPI_HX8379A_DISPLAY Panel"
+       depends on DRM_MDFLD || DRM_CTP
+       default n
+       help
+         xxxxxx
+
 config SUPPORT_P73L_TWO_LANE
        bool "Support pf450cl pad with two lane"
        depends on DRM_MDFLD || DRM_CTP

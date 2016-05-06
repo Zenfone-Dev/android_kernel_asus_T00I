@@ -63,10 +63,12 @@ extern struct mdfld_dsi_encoder *mdfld_dsi_dpi_init(struct drm_device *dev,
 #define WINTEK_PANEL_NT35510 0x51
 #define WINTEK_PANEL_NT35510S 0x52
 
-
 #ifdef CONFIG_SUPPORT_DDS_MIPI_SWITCH
 void mdfld_reset_dpi_panel(struct drm_psb_private *dev_priv, int connected);
 void mdfld_reset_same_dpi_panel(struct drm_psb_private *dev_priv);
+void mdfld_reset_same_dpi_panel_work(struct work_struct *work);
+#endif
+#ifdef CONFIG_SUPPORT_MIPI_HX8379A_DISPLAY
 void mdfld_reset_same_dpi_panel_work(struct work_struct *work);
 #endif
 

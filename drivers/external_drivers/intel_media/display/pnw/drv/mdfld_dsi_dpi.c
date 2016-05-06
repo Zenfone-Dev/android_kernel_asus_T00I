@@ -32,6 +32,11 @@
 #include "mdfld_csc.h"
 #include "psb_irq.h"
 #include "dispmgrnl.h"
+#include "mdfld_dsi_esd.h"
+
+#ifdef CONFIG_SUPPORT_MIPI_HX8379A_DISPLAY
+extern int entry_mode;
+#endif
 
 static
 u16 mdfld_dsi_dpi_to_byte_clock_count(int pixel_clock_count,
@@ -126,6 +131,70 @@ void mdfld_dsi_dpi_set_color_mode(struct mdfld_dsi_config *dsi_config , bool on)
 	return;
 }
 
+static int intel_dc_dsi_check_latch_out(struct mdfld_dsi_config *dsi_config)
+{
+	struct mdfld_dsi_hw_registers *regs = NULL;
+	struct drm_device *dev = NULL;
+	int retry = 10, ret = -1;
+
+	if (!dsi_config)
+		goto exit;
+
+	dev = dsi_config->dev;
+	regs = &dsi_config->regs;
+
+	if (!dev)
+		goto exit;
+
+	while (retry) {
+		if ((REG_READ(regs->mipi_reg) & BIT17)) {
+			DRM_DEBUG("%s: reg 61190 = 0x%08x - lp11 in %d retries\n",
+					__func__, REG_READ(regs->mipi_reg), 10-retry);
+		} else {
+			DRM_DEBUG("%s: reg 61190 = 0x%08x - lp00 in %d retries\n",
+					__func__, REG_READ(regs->mipi_reg), 10-retry);
+		}
+
+		udelay(10);
+		retry--;
+	}
+
+exit:
+	return ret;
+}
+
+static int intel_dc_dsi_wait_for_lp00(struct mdfld_dsi_config *dsi_config)
+{
+	struct mdfld_dsi_hw_registers *regs = NULL;
+	struct drm_device *dev = NULL;
+	int retry = 1000, ret = -1;
+
+	if (!dsi_config)
+		goto exit;
+
+	dev = dsi_config->dev;
+	regs = &dsi_config->regs;
+
+	if (!dev)
+		goto exit;
+
+	while (retry) {
+		if ((REG_READ(regs->mipi_reg) & BIT17)) {
+			udelay(10);
+			retry--;
+		} else {
+			ret = 0;
+			break;
+		}
+	}
+
+	DRM_INFO("%s: retry %d times\n", __func__, 1000 - retry);
+
+exit:
+	return ret;
+}
+static int __dpi_exit_ulps_locked(struct mdfld_dsi_config *dsi_config);
+
 static int __dpi_enter_ulps_locked(struct mdfld_dsi_config *dsi_config)
 {
 	struct mdfld_dsi_hw_registers *regs = &dsi_config->regs;
@@ -133,6 +202,12 @@ static int __dpi_enter_ulps_locked(struct mdfld_dsi_config *dsi_config)
 	struct drm_device *dev = dsi_config->dev;
 	struct mdfld_dsi_pkg_sender *sender
 			= mdfld_dsi_get_pkg_sender(dsi_config);
+	u32 mipi_val = 0;
+	int retry = 5;
+
+ulps_recovery:
+
+	PSB_DEBUG_ENTRY("\n");
 
 	ctx->device_ready = REG_READ(regs->device_ready_reg);
 
@@ -146,14 +221,37 @@ static int __dpi_enter_ulps_locked(struct mdfld_dsi_config *dsi_config)
 		return -EINVAL;
 	}
 
+	/* check latch out, expected to be lp11 */
+	intel_dc_dsi_check_latch_out(dsi_config);
+
 	/*wait for all FIFOs empty*/
 	mdfld_dsi_wait_for_fifos_empty(sender);
 
 	/*inform DSI host is to be put on ULPS*/
-	ctx->device_ready |= DSI_POWER_STATE_ULPS_ENTER;
+	ctx->device_ready |= (DSI_POWER_STATE_ULPS_ENTER | DSI_DEVICE_READY);
 	REG_WRITE(regs->device_ready_reg, ctx->device_ready);
+	mdelay(1);
 
-	DRM_INFO("%s: entered ULPS state\n", __func__);
+	/* check latch out, expected to be lp00 */
+	intel_dc_dsi_check_latch_out(dsi_config);
+
+	if (intel_dc_dsi_wait_for_lp00(dsi_config)) {
+		DRM_ERROR("faild to wait for lp00 status\n");
+		DRM_ERROR("reg[0x%x] = 0x%x\n", regs->mipi_reg, REG_READ(regs->mipi_reg));
+
+		if(retry--){
+		    DRM_INFO("%s: retry enter ulps (times=%d)\n", __func__, 5-retry);
+		    if (__dpi_exit_ulps_locked(dsi_config)) {
+			 DRM_ERROR("Failed to exit ULPS\n");
+		    }
+		    goto ulps_recovery;
+		}
+	}
+
+	/* set AFE hold value */
+	mipi_val = REG_READ(regs->mipi_reg);
+	REG_WRITE(regs->mipi_reg, (mipi_val & (~PASS_FROM_SPHY_TO_AFE)));
+
 	return 0;
 }
 
@@ -165,9 +263,18 @@ static int __dpi_exit_ulps_locked(struct mdfld_dsi_config *dsi_config)
 
 	ctx->device_ready = REG_READ(regs->device_ready_reg);
 
+	/*inform DSI host is to be put on ULPS*/
+	ctx->device_ready = (DSI_POWER_STATE_ULPS_ENTER | DSI_DEVICE_READY);
+	REG_WRITE(regs->device_ready_reg, ctx->device_ready);
+
+	mdelay(1);
+	/* clear AFE hold value*/
+	REG_WRITE(regs->mipi_reg, PASS_FROM_SPHY_TO_AFE);
+	mdelay(1);
+
 	/*enter ULPS EXIT state*/
 	ctx->device_ready &= ~DSI_POWER_STATE_ULPS_MASK;
-	ctx->device_ready |= DSI_POWER_STATE_ULPS_EXIT;
+	ctx->device_ready |= (DSI_POWER_STATE_ULPS_EXIT | DSI_DEVICE_READY);
 	REG_WRITE(regs->device_ready_reg, ctx->device_ready);
 
 	/*wait for 1ms as spec suggests*/
@@ -175,9 +282,116 @@ static int __dpi_exit_ulps_locked(struct mdfld_dsi_config *dsi_config)
 
 	/*clear ULPS state*/
 	ctx->device_ready &= ~DSI_POWER_STATE_ULPS_MASK;
+	ctx->device_ready |= DSI_DEVICE_READY;
 	REG_WRITE(regs->device_ready_reg, ctx->device_ready);
+
+	mdelay(1);
+
+	PSB_DEBUG_ENTRY("%s: exited ULPS state\n", __func__);
 	return 0;
 }
+
+#ifdef CONFIG_SUPPORT_DDS_MIPI_SWITCH
+static void dds_dump_hw_context(struct mdfld_dsi_hw_context *ctx){
+	printk("ctx->vgacntr = %8x\n", ctx->vgacntr);
+
+	/*plane*/
+	printk("ctx->dspcntr = %8x\n", ctx->dspcntr);
+	printk("ctx->dspsize = %8x\n", ctx->dspsize);
+	printk("ctx->dspsurf = %8x\n", ctx->dspsurf);
+	printk("ctx->dsppos = %8x\n", ctx->dsppos);
+	printk("ctx->dspstride = %8x\n", ctx->dspstride);
+	printk("ctx->dsplinoff = %8x\n", ctx->dsplinoff);
+
+	/*overlay*/
+	printk("ctx->ovaadd = %8x\n", ctx->ovaadd);
+	printk("ctx->ovcadd = %8x\n", ctx->ovcadd);
+
+	/* gamma and csc */
+	//printk("ctx->vgacntr = %8x\n", ctx->palette[256];
+	//printk("ctx->vgacntr = %8x\n", ctx->color_coef[6];
+
+	/*pipe regs*/
+	printk("ctx->htotal = %8x\n", ctx->htotal);
+	printk("ctx->hblank = %8x\n", ctx->hblank);
+	printk("ctx->hsync = %8x\n", ctx->hsync);
+	printk("ctx->vtotal = %8x\n", ctx->vtotal);
+	printk("ctx->vblank = %8x\n", ctx->vblank);
+	printk("ctx->vsync = %8x\n", ctx->vsync);
+	printk("ctx->pipestat = %8x\n", ctx->pipestat);
+
+	printk("ctx->pipesrc = %8x\n", ctx->pipesrc);
+
+	printk("ctx->dpll = %8x\n", ctx->dpll);
+	printk("ctx->fp = %8x\n", ctx->fp);
+	printk("ctx->pipeconf = %8x\n", ctx->pipeconf);
+
+	/*mipi port*/
+	printk("ctx->mipi = %8x\n", ctx->mipi);
+
+	/*DSI controller regs*/
+	printk("ctx->device_ready = %8x\n", ctx->device_ready);
+	printk("ctx->intr_stat = %8x\n", ctx->intr_stat);
+	printk("ctx->intr_en = %8x\n", ctx->intr_en);
+	printk("ctx->dsi_func_prg = %8x\n", ctx->dsi_func_prg);
+	printk("ctx->hs_tx_timeout = %8x\n", ctx->hs_tx_timeout);
+	printk("ctx->lp_rx_timeout = %8x\n", ctx->lp_rx_timeout);
+	printk("ctx->turn_around_timeout = %8x\n", ctx->turn_around_timeout);
+	printk("ctx->device_reset_timer = %8x\n", ctx->device_reset_timer);
+	printk("ctx->dpi_resolution = %8x\n", ctx->dpi_resolution);
+	printk("ctx->dbi_fifo_throttle = %8x\n", ctx->dbi_fifo_throttle);
+	printk("ctx->hsync_count = %8x\n", ctx->hsync_count);
+	printk("ctx->hbp_count = %8x\n", ctx->hbp_count);
+	printk("ctx->hfp_count = %8x\n", ctx->hfp_count);
+	printk("ctx->hactive_count = %8x\n", ctx->hactive_count);
+	printk("ctx->vsync_count = %8x\n", ctx->vsync_count);
+	printk("ctx->vbp_count = %8x\n", ctx->vbp_count);
+	printk("ctx->vfp_count = %8x\n", ctx->vfp_count);
+	printk("ctx->high_low_switch_count = %8x\n", ctx->high_low_switch_count);
+	printk("ctx->dpi_control = %8x\n", ctx->dpi_control);
+	printk("ctx->dpi_data = %8x\n", ctx->dpi_data);
+	printk("ctx->init_count = %8x\n", ctx->init_count);
+	printk("ctx->max_return_pack_size = %8x\n", ctx->max_return_pack_size);
+	printk("ctx->video_mode_format = %8x\n", ctx->video_mode_format);
+	printk("ctx->eot_disable = %8x\n", ctx->eot_disable);
+	printk("ctx->lp_byteclk = %8x\n", ctx->lp_byteclk);
+	printk("ctx->lp_gen_data = %8x\n", ctx->lp_gen_data);
+	printk("ctx->hs_gen_data = %8x\n", ctx->hs_gen_data);
+	printk("ctx->lp_gen_ctrl = %8x\n", ctx->lp_gen_ctrl);
+	printk("ctx->hs_gen_ctrl = %8x\n", ctx->hs_gen_ctrl);
+	printk("ctx->gen_fifo_stat = %8x\n", ctx->gen_fifo_stat);
+	printk("ctx->hs_ls_dbi_enable = %8x\n", ctx->hs_ls_dbi_enable);
+	printk("ctx->dphy_param = %8x\n", ctx->dphy_param);
+	printk("ctx->dbi_bw_ctrl = %8x\n", ctx->dbi_bw_ctrl);
+	printk("ctx->clk_lane_switch_time_cnt = %8x\n", ctx->clk_lane_switch_time_cnt);
+
+	/*MIPI adapter regs*/
+	printk("ctx->mipi_control = %8x\n", ctx->mipi_control);
+	printk("ctx->mipi_data_addr = %8x\n", ctx->mipi_data_addr);
+	printk("ctx->mipi_data_len = %8x\n", ctx->mipi_data_len);
+	printk("ctx->mipi_cmd_addr = %8x\n", ctx->mipi_cmd_addr);
+	printk("ctx->mipi_cmd_len = %8x\n", ctx->mipi_cmd_len);
+
+	/*panel status*/
+	printk("ctx->panel_on = %8x\n", ctx->panel_on);
+	printk("ctx->backlight_level = %8x\n", ctx->backlight_level);
+
+	printk("ctx->pll_bypass_mode = %8x\n", ctx->pll_bypass_mode);
+	printk("ctx->cck_div = %8x\n", ctx->cck_div);
+	/*brightness*/
+	printk("ctx->lastbrightnesslevel = %8x\n", ctx->lastbrightnesslevel);
+
+	/*dpst register values*/
+	printk("ctx->histogram_intr_ctrl = %8x\n", ctx->histogram_intr_ctrl);
+	printk("ctx->histogram_logic_ctrl = %8x\n", ctx->histogram_logic_ctrl);
+	printk("ctx->aimg_enhance_bin = %8x\n", ctx->aimg_enhance_bin);
+	printk("ctx->lvds_port_ctrl = %8x\n", ctx->lvds_port_ctrl);
+
+}
+
+extern void reportPadStationI2CFail(char *devname);
+
+#endif
 
 /**
  * Power on sequence for video mode MIPI panel.
@@ -191,6 +405,7 @@ static int __dpi_panel_power_on(struct mdfld_dsi_config *dsi_config,
 	struct mdfld_dsi_hw_context *ctx;
 	struct drm_psb_private *dev_priv;
 	struct drm_device *dev;
+
 	int retry, reset_count = 10;
 	int i;
 	int err = 0;
@@ -202,6 +417,90 @@ static int __dpi_panel_power_on(struct mdfld_dsi_config *dsi_config,
 	ctx = &dsi_config->dsi_hw_context;
 	dev = dsi_config->dev;
 	dev_priv = dev->dev_private;
+
+#ifdef CONFIG_SUPPORT_DDS_MIPI_SWITCH
+
+	//dds_dump_hw_context(ctx);
+
+	if (p_funcs->dsi_controller_init)
+		p_funcs->dsi_controller_init(dsi_config);
+
+	if (p_funcs->get_config_mode)
+		dsi_config->fixed_mode = p_funcs->get_config_mode();
+
+	printk("[DISPLAY][DDS] %s: panel_id = %d, panel_turn_on = %d\n", __func__, panel_id, panel_turn_on);
+
+	if(panel_id == 0){
+		//480x800
+		ctx->dpll = 0x800000 ;
+		ctx->fp = 0xa4 ;
+		ctx->htotal = 0x23d01df;
+		ctx->hblank = 0x23d01df;
+		ctx->hsync = 0x211020d;
+		ctx->vtotal = 0x340031f;
+		ctx->vblank = 0x340031f;
+		ctx->vsync = 0x330032e;
+
+		/*pipe source*/
+		ctx->pipesrc = 0x1df031f;
+
+		//__mdfld_dsi_dpi_set_timing()
+		ctx->dpi_resolution =  0x32001e0;
+
+		ctx->hsync_count = 0x6;
+		ctx->hbp_count = 0x42;
+		ctx->hfp_count = 0x45;
+		ctx->hactive_count = 0x2d0;
+		ctx->vsync_count = 0x3;
+		ctx->vbp_count = 0x18;
+		ctx->vfp_count = 0x16;
+
+		ctx->pipeconf = 0xf11c0000;
+
+		ctx->dspsize =  0x31f01df;
+		ctx->dspstride = 0xc80;
+
+		ctx->cck_div = 1;
+		ctx->pll_bypass_mode = 0;
+
+	}else{
+		//800x1280
+		ctx->dpll = 0x100000 ;
+		ctx->fp = 0x1e3 ;
+		ctx->htotal = 0x361031f;
+		ctx->hblank = 0x361031f;
+		ctx->hsync = 0x341033f;
+		ctx->vtotal = 0x52304ff;
+		ctx->vblank = 0x52304ff;
+		ctx->vsync = 0x513050f;
+
+		/*pipe source*/
+		ctx->pipesrc = 0x31f04ff;
+
+		//__mdfld_dsi_dpi_set_timing()
+		ctx->dpi_resolution =  0x5000320;
+
+		ctx->hsync_count = 0x1;
+		ctx->hbp_count = 0x18;
+		ctx->hfp_count = 0x18;
+		ctx->hactive_count = 0x258;
+		ctx->vsync_count = 0x3;
+		ctx->vbp_count = 0xc;
+		ctx->vfp_count = 0xc;
+
+		ctx->pipeconf = 0xe91c0000;
+
+		ctx->dspsize =  0x4ff031f;
+		ctx->dspstride = 0xc80;
+
+		ctx->cck_div = 0;
+		ctx->pll_bypass_mode = 1;
+
+	}
+
+	//dds_dump_hw_context(ctx);
+
+#endif
 
 	if (!ospm_power_using_hw_begin(OSPM_DISPLAY_ISLAND,
 					OSPM_UHB_FORCE_POWER_ON))
@@ -218,17 +517,17 @@ reset_recovery:
 			uint32_t dpll = 0;
 
 			REG_WRITE(regs->dpll_reg, dpll);
-			if(ctx->cck_div)
+			if(ctx->cck_div) {
 				dpll = dpll | BIT11;
-			REG_WRITE(regs->dpll_reg, dpll);
-			udelay(2);
+				REG_WRITE(regs->dpll_reg, dpll);
+				udelay(1);
+			}
 			dpll = dpll | BIT12;
 			REG_WRITE(regs->dpll_reg, dpll);
-			udelay(2);
+			mdelay(1);
 			dpll = dpll | BIT13;
 			REG_WRITE(regs->dpll_reg, dpll);
-			dpll = dpll | BIT31;
-			REG_WRITE(regs->dpll_reg, dpll);
+			mdelay(1);
 		} else {
 			REG_WRITE(regs->dpll_reg, 0x0);
 			REG_WRITE(regs->fp_reg, 0x0);
@@ -251,6 +550,25 @@ reset_recovery:
 		}
 	}
 
+	REG_WRITE(regs->eot_disable_reg,
+			(REG_READ(regs->eot_disable_reg) & ~BIT1));
+	REG_WRITE(regs->device_ready_reg, ~BIT0);
+	REG_WRITE(regs->device_ready_reg, BIT0);
+	mdelay(1);
+
+	/*exit ULPS*/
+	if (__dpi_exit_ulps_locked(dsi_config)) {
+		DRM_ERROR("Failed to exit ULPS\n");
+		goto power_on_err;
+	}
+
+	/*update MIPI port config*/
+	REG_WRITE(regs->mipi_reg, (ctx->mipi | REG_READ(regs->mipi_reg)));
+
+	/*unready dsi adapter for re-programming*/
+	REG_WRITE(regs->device_ready_reg,
+			REG_READ(regs->device_ready_reg) & ~(DSI_DEVICE_READY));
+
 	/*D-PHY parameter*/
 	REG_WRITE(regs->dphy_param_reg, ctx->dphy_param);
 
@@ -270,8 +588,14 @@ reset_recovery:
 	REG_WRITE(regs->lp_byteclk_reg, ctx->lp_byteclk);
 	REG_WRITE(regs->clk_lane_switch_time_cnt_reg,
 		ctx->clk_lane_switch_time_cnt);
-	REG_WRITE(regs->video_mode_format_reg, ctx->video_mode_format);
 	REG_WRITE(regs->dsi_func_prg_reg, ctx->dsi_func_prg);
+	if(ctx->pll_bypass_mode){
+		//Force using non-burst pulse event mode here
+		REG_WRITE(regs->video_mode_format_reg, 0x1);
+	}
+	else{
+		REG_WRITE(regs->video_mode_format_reg, ctx->video_mode_format);
+	}
 
 	/*DSI timing*/
 	REG_WRITE(regs->dpi_resolution_reg, ctx->dpi_resolution);
@@ -296,9 +620,21 @@ reset_recovery:
 	REG_WRITE(regs->dspstride_reg, ctx->dspstride);
 
 	/*Setup plane*/
+
+#ifdef CONFIG_SUPPORT_MIPI_HX8379A_DISPLAY
+	if((ctx->dspsurf == 0)&&(entry_mode==1)){
+		REG_WRITE(regs->dspsize_reg, 0);
+	}
+	else{
+		REG_WRITE(regs->dspsize_reg, ctx->dspsize);
+	}
+#else
 	REG_WRITE(regs->dspsize_reg, ctx->dspsize);
+#endif
+
 	REG_WRITE(regs->dspsurf_reg, ctx->dspsurf);
 	REG_WRITE(regs->dsplinoff_reg, ctx->dsplinoff);
+
 	REG_WRITE(regs->vgacntr_reg, ctx->vgacntr);
 
 	/*restore color_coef (chrome) */
@@ -318,14 +654,8 @@ reset_recovery:
 	}
 #endif
 
-	/*exit ULPS state*/
-	__dpi_exit_ulps_locked(dsi_config);
-
 	/*Enable DSI Controller*/
-	REG_WRITE(regs->device_ready_reg, ctx->device_ready | BIT0);
-
-	/*set low power output hold*/
-	REG_WRITE(regs->mipi_reg, (ctx->mipi | BIT16));
+	REG_WRITE(regs->device_ready_reg, (REG_READ(regs->device_ready_reg) | BIT0));
 
 	/**
 	 * Different panel may have different ways to have
@@ -334,8 +664,15 @@ reset_recovery:
 	if (p_funcs && p_funcs->drv_ic_init) {
 		if (p_funcs->drv_ic_init(dsi_config)) {
 			if (!reset_count) {
-				err = -EAGAIN;
-				goto power_on_err;
+				DRM_ERROR("Initial panel failed\n");
+#ifdef CONFIG_SUPPORT_DDS_MIPI_SWITCH
+				if( panel_id == DDS_NT35521 ){
+					reportPadStationI2CFail("DISPLAY");
+					DRM_INFO("[DISPLAY] [DDS] %s: Initial panel_id %d failed, do reportPadStationI2CFail().\n", __func__, panel_id);
+
+				}
+#endif
+				goto reset_err_bypass;
 			}
 			pmu_nc_set_power_state(OSPM_MIPI_ISLAND,
 					OSPM_ISLAND_DOWN, OSPM_REG_TYPE);
@@ -343,9 +680,43 @@ reset_recovery:
 			pmu_nc_set_power_state(OSPM_MIPI_ISLAND,
 					OSPM_ISLAND_UP, OSPM_REG_TYPE);
 
-			DRM_ERROR("Failed to init dsi controller, reset it!\n");
+			DRM_ERROR("Failed to init dsi controller, reset it!(reset_count = %d)\n",reset_count);
 			goto reset_recovery;
 		}
+	}
+
+reset_err_bypass:
+	if(ctx->pll_bypass_mode){
+		/*Reprogram to use pll clock*/
+		REG_WRITE(regs->dpll_reg, 0x0);
+		REG_WRITE(regs->fp_reg, 0x0);
+		REG_WRITE(regs->fp_reg, ctx->fp);
+		REG_WRITE(regs->dpll_reg, ((ctx->dpll) & ~BIT30));
+
+		udelay(2);
+		REG_WRITE(regs->dpll_reg, 0x2 << 17 );
+		mdelay(1);
+		REG_WRITE(regs->dpll_reg, (0x2 << 17 | BIT31));
+
+		/*wait for PLL lock on pipe*/
+		retry = 10000;
+		while (--retry && !(REG_READ(PIPEACONF) & BIT29))
+			udelay(3);
+		if (!retry) {
+			DRM_ERROR("PLL failed to lock on pipe\n");
+			err = -EAGAIN;
+			goto power_on_err;
+		}
+
+		/*Switch back to burst mode*/
+		REG_WRITE(regs->video_mode_format_reg, ctx->video_mode_format);
+
+		/*Clear device ready reg*/
+		REG_WRITE(regs->device_ready_reg,REG_READ(regs->device_ready_reg) & ~DSI_DEVICE_READY);
+		msleep(1);
+		/*Enable DSI Controller*/
+		REG_WRITE(regs->device_ready_reg,REG_READ(regs->device_ready_reg) | DSI_DEVICE_READY);
+		msleep(1);
 	}
 
 	/**
@@ -398,6 +769,10 @@ reset_recovery:
 
 	REG_WRITE(regs->dspcntr_reg, val);
 
+#ifdef CONFIG_SUPPORT_MIPI_HX8379A_DISPLAY
+	usleep_range(50000, 50000);
+#endif
+
 	/*Notify PVR module that screen is on*/
 	if (dev_priv->pvr_screen_event_handler)
 		dev_priv->pvr_screen_event_handler(dev, 1);
@@ -441,19 +816,26 @@ static int __dpi_panel_power_off(struct mdfld_dsi_config *dsi_config,
 					OSPM_UHB_FORCE_POWER_ON))
 		return -EAGAIN;
 
+#ifdef CONFIG_SUPPORT_DDS_MIPI_SWITCH
+	printk("[DISPLAY][DDS] %s: panel_id = %d, panel_turn_on = %d\n", __func__, panel_id, panel_turn_on);
+#endif
+
 	ctx->lastbrightnesslevel = psb_brightness;
 	if (p_funcs && p_funcs->set_brightness)
 		if (p_funcs->set_brightness(dsi_config, 0))
 			DRM_ERROR("Failed to set panel brightness\n");
+
+#ifdef CONFIG_SUPPORT_MIPI_HX8379A_DISPLAY
+	usleep_range(100000, 100000);
+#endif
 
 	/*Notify PVR module that screen is off*/
 	if (dev_priv->pvr_screen_event_handler)
 		dev_priv->pvr_screen_event_handler(dev, 0);
 
 	/*save the plane informaton, for it will updated*/
-	ctx->dspsurf = REG_READ(regs->dspsurf_reg);
-	ctx->dsplinoff = REG_READ(regs->dsplinoff_reg);
-	ctx->dspsize = REG_READ(regs->dspsize_reg);
+	ctx->dspsurf = dev_priv->init_screen_start;
+	ctx->dsplinoff = dev_priv->init_screen_offset;
 	ctx->pipestat = REG_READ(regs->pipestat_reg);
 	ctx->dspcntr = REG_READ(regs->dspcntr_reg);
 	ctx->dspstride= REG_READ(regs->dspstride_reg);
@@ -516,14 +898,29 @@ static int __dpi_panel_power_off(struct mdfld_dsi_config *dsi_config,
 		}
 	}
 
-	/*clear Low power output hold*/
-	REG_WRITE(regs->mipi_reg, (REG_READ(regs->mipi_reg) & ~BIT16));
+	/* check latch out, expected to be lp00 */
+	intel_dc_dsi_check_latch_out(dsi_config);
 
-	/*Disable DSI controller*/
-	REG_WRITE(regs->device_ready_reg, (ctx->device_ready & ~BIT0));
+	/*Set clock stopping*/
+	REG_WRITE(regs->eot_disable_reg, (REG_READ(regs->eot_disable_reg) | BIT1));
 
-	/*enter ULPS*/
-	__dpi_enter_ulps_locked(dsi_config);
+	/* clear device ready and reset device ready
+	 * to make clock stopping setting take effects.
+	 */
+	REG_WRITE(regs->device_ready_reg, (REG_READ(regs->device_ready_reg) & ~BIT0));
+	REG_WRITE(regs->device_ready_reg, (REG_READ(regs->device_ready_reg) | BIT0));
+
+	/* check latch out, expected to be lp11 */
+	intel_dc_dsi_check_latch_out(dsi_config);
+
+	if (__dpi_enter_ulps_locked(dsi_config)) {
+		DRM_ERROR("Faild to enter ULPS\n");
+		goto power_off_err;
+	}
+
+       //workaround for MIPI D0~D3 power leakage
+       __dpi_exit_ulps_locked(dsi_config);
+       __dpi_enter_ulps_locked(dsi_config);
 
 	/*Disable DSI PLL*/
 	pipe0_enabled = (REG_READ(PIPEACONF) & BIT31) ? 1 : 0;
@@ -534,6 +931,16 @@ static int __dpi_panel_power_off(struct mdfld_dsi_config *dsi_config,
 		/*power gate pll*/
 		REG_WRITE(regs->dpll_reg, BIT30);
 	}
+
+#if defined(CONFIG_SUPPORT_MIPI_OTM8018B_DISPLAY)
+	if (p_funcs && p_funcs->gpio_power_off) {
+		if (p_funcs->gpio_power_off(dsi_config)) {
+			DRM_ERROR("Failed to power off panel\n");
+			err = -EAGAIN;
+			goto power_off_err;
+		}
+	}
+#endif
 
 power_off_err:
 	ospm_power_using_hw_end(OSPM_DISPLAY_ISLAND);
@@ -551,8 +958,20 @@ static int mdfld_dsi_dpi_panel_turn_on(struct mdfld_dsi_config *dsi_config,
 	struct mdfld_dsi_hw_context *ctx;
 	int err = 0;
 
+#ifdef CONFIG_SUPPORT_DDS_MIPI_SWITCH
+	printk("[DISPLAY][DDS] %s: panel_id = %d, panel_turn_on = %d\n", __func__, panel_id, panel_turn_on);
+#endif
+
+#ifdef CONFIG_SUPPORT_DDS_MIPI_SWITCH
+	err = mdfld_dsi_send_dpi_spk_pkg_lp(sender,
+			MDFLD_DSI_DPI_SPK_TURN_ON);
+#elif CONFIG_SUPPORT_MIPI_HX8379A_DISPLAY
+	err = mdfld_dsi_send_dpi_spk_pkg_lp(sender,
+			MDFLD_DSI_DPI_SPK_TURN_ON);
+#else
 	err = mdfld_dsi_send_dpi_spk_pkg_hs(sender,
 			MDFLD_DSI_DPI_SPK_TURN_ON);
+#endif
 	/*According HW DSI spec, here need wait for 100ms*/
 	/*To optimize dpms flow, move sleep out of mutex*/
 	/* msleep(100); */
@@ -575,19 +994,367 @@ static int mdfld_dsi_dpi_panel_shut_down(struct mdfld_dsi_config *dsi_config,
 	struct mdfld_dsi_hw_context *ctx;
 	int err = 0;
 
+#ifdef CONFIG_SUPPORT_DDS_MIPI_SWITCH
+	printk("[DISPLAY][DDS] %s: panel_id = %d, panel_turn_on = %d\n", __func__, panel_id, panel_turn_on);
+#endif
+
 	ctx = &dsi_config->dsi_hw_context;
 	ctx->lastbrightnesslevel = psb_brightness;
 	if (p_funcs->set_brightness(dsi_config, 0))
 		DRM_ERROR("Failed to set panel brightness\n");
 
+#ifdef CONFIG_SUPPORT_MIPI_HX8379A_DISPLAY
+	usleep_range(50000, 50000);
+#endif
+
+#ifdef CONFIG_SUPPORT_DDS_MIPI_SWITCH
+	err = mdfld_dsi_send_dpi_spk_pkg_lp(sender,
+			MDFLD_DSI_DPI_SPK_SHUT_DOWN);
+#elif CONFIG_SUPPORT_MIPI_HX8379A_DISPLAY
+	err = mdfld_dsi_send_dpi_spk_pkg_lp(sender,
+			MDFLD_DSI_DPI_SPK_SHUT_DOWN);
+#else
 	err = mdfld_dsi_send_dpi_spk_pkg_hs(sender,
 			MDFLD_DSI_DPI_SPK_SHUT_DOWN);
+#endif
 	/*According HW DSI spec, here need wait for 100ms*/
 	/*To optimize dpms flow, move sleep out of mutex*/
 	/* msleep(100); */
 
 	return err;
 }
+
+#ifdef CONFIG_SUPPORT_DDS_MIPI_SWITCH
+void mdfld_reset_dpi_panel(struct drm_psb_private *dev_priv, int connected)
+{
+	struct mdfld_dsi_config *dsi_config = dev_priv->dsi_configs[0];
+	struct mdfld_dsi_dpi_output *dpi_output = dev_priv->dpi_output;
+	struct panel_funcs *p_funcs;
+	struct drm_device *dev;
+
+	if (!dsi_config || !dpi_output) {
+		if (!dsi_config)
+			DRM_INFO("%s: dsi_config NULL\n", __func__);
+		else if (!dpi_output)
+			DRM_INFO("%s: dpi_output NULL\n", __func__);
+		return;
+	}
+
+	dev = dsi_config->dev;
+
+	/*disable ESD when HDMI connected*/
+	if (hdmi_state) {
+		DRM_INFO("%s: hdmi_state %d\n", __func__, hdmi_state);
+		return;
+	}
+
+	DRM_INFO("[DISPLAY] [DDS] %s: panel_turn_on = %d, dsi_hw_context.panel_on =%d.\n",
+							__func__, panel_turn_on, dsi_config->dsi_hw_context.panel_on);
+
+	mutex_lock(&dsi_config->context_lock);
+
+	if(panel_turn_on == DDS_NONE){
+		panel_id = connected;
+		DRM_INFO("[DISPLAY] [DDS] %s: change panel_id =%d , skip reset.\n", __func__, panel_id);
+		mutex_unlock(&dsi_config->context_lock);
+		return;
+	}
+
+	if(panel_turn_on == connected){
+		DRM_INFO("[DISPLAY] [DDS] %s: panel_id = %d ,panel_turn_on = %d, but do not skip reset.\n", __func__, panel_id, panel_turn_on);
+		//mutex_unlock(&dsi_config->context_lock);
+		//return;
+	}
+
+	PSB_DEBUG_ENTRY("\n");
+
+	p_funcs = dpi_output->p_funcs;
+	if (!p_funcs) {
+		DRM_ERROR("%s: invalid panel function table\n", __func__);
+		mutex_unlock(&dsi_config->context_lock);
+		return;
+	}
+
+	if (dev_priv->pvr_screen_event_handler)
+		dev_priv->pvr_screen_event_handler(dev, 0);
+
+	if (__dpi_panel_power_off(dsi_config, p_funcs)) {
+		DRM_INFO("%s: off failed\n", __func__);
+		//mutex_unlock(&dsi_config->context_lock);
+		//return;
+	}
+
+	acquire_ospm_lock();
+
+//	ospm_power_island_down(OSPM_DISPLAY_ISLAND);
+	ospm_suspend_display(gpDrmDevice);
+
+	panel_id = connected;
+	DRM_INFO("[DISPLAY] [DDS] %s: Enter, change panel_id =%d\n", __func__, panel_id);
+
+//	ospm_power_island_up(OSPM_DISPLAY_ISLAND);
+	ospm_resume_display(gpDrmDevice->pdev);
+
+	release_ospm_lock();
+
+	if (__dpi_panel_power_on(dsi_config, p_funcs)) {
+		DRM_INFO("%s: on failed\n", __func__);
+		//psb_enable_vblank(dev, 0);
+		//mutex_unlock(&dsi_config->context_lock);
+		//return;
+	}
+
+	if (dev_priv->pvr_screen_event_handler)
+		dev_priv->pvr_screen_event_handler(dev, 1);
+
+	mutex_unlock(&dsi_config->context_lock);
+	//leve1_cnt = 0;
+	//vsync_timeout_cnt = 0;
+	DRM_INFO("%s: End panel reset\n", __func__);
+}
+
+void mdfld_reset_same_dpi_panel_work(struct work_struct *work)
+{
+	struct drm_psb_private *dev_priv =
+		container_of(work, struct drm_psb_private, reset_panel_work);
+
+	struct mdfld_dsi_config *dsi_config = dev_priv->dsi_configs[0];
+	struct mdfld_dsi_dpi_output *dpi_output = dev_priv->dpi_output;
+	struct panel_funcs *p_funcs;
+	struct drm_device *dev;
+
+	if (!dsi_config || !dpi_output) {
+		if (!dsi_config)
+			DRM_INFO("%s: dsi_config NULL\n", __func__);
+		else if (!dpi_output)
+			DRM_INFO("%s: dpi_output NULL\n", __func__);
+		return;
+	}
+
+	dev = dsi_config->dev;
+
+	/*disable ESD when HDMI connected*/
+	if (hdmi_state) {
+		DRM_INFO("%s: hdmi_state %d\n", __func__, hdmi_state);
+		return;
+	}
+
+	DRM_INFO("[DISPLAY] [DDS] %s: Enter\n", __func__);
+
+	mutex_lock(&dsi_config->context_lock);
+
+	if((panel_turn_on == DDS_NONE)||(dsi_config->dsi_hw_context.panel_on==0)){
+		DRM_INFO("[DISPLAY] [DDS] %s:  panel_turn_on=%d , panel_on=%d, skip reset.\n",
+							__func__, panel_turn_on, dsi_config->dsi_hw_context.panel_on);
+		mutex_unlock(&dsi_config->context_lock);
+		return;
+	}
+
+	PSB_DEBUG_ENTRY("\n");
+
+	p_funcs = dpi_output->p_funcs;
+	if (!p_funcs) {
+		DRM_ERROR("%s: invalid panel function table\n", __func__);
+		mutex_unlock(&dsi_config->context_lock);
+		return;
+	}
+
+	if (dev_priv->pvr_screen_event_handler)
+		dev_priv->pvr_screen_event_handler(dev, 0);
+
+	if (__dpi_panel_power_off(dsi_config, p_funcs)) {
+		DRM_INFO("%s: off failed\n", __func__);
+		//mutex_unlock(&dsi_config->context_lock);
+		//return;
+	}
+
+	acquire_ospm_lock();
+
+//	ospm_power_island_down(OSPM_DISPLAY_ISLAND);
+	ospm_suspend_display(gpDrmDevice);
+
+//	ospm_power_island_up(OSPM_DISPLAY_ISLAND);
+	ospm_resume_display(gpDrmDevice->pdev);
+
+	release_ospm_lock();
+
+	if (__dpi_panel_power_on(dsi_config, p_funcs)) {
+		DRM_INFO("%s: on failed\n", __func__);
+		//psb_enable_vblank(dev, 0);
+		//mutex_unlock(&dsi_config->context_lock);
+		//return;
+	}
+
+	if (dev_priv->pvr_screen_event_handler)
+		dev_priv->pvr_screen_event_handler(dev, 1);
+
+	mutex_unlock(&dsi_config->context_lock);
+	//leve1_cnt = 0;
+	//vsync_timeout_cnt = 0;
+	DRM_INFO("%s: End panel reset\n", __func__);
+}
+
+void mdfld_reset_same_dpi_panel(struct drm_psb_private *dev_priv)
+{
+	struct mdfld_dsi_config *dsi_config = dev_priv->dsi_configs[0];
+	struct mdfld_dsi_dpi_output *dpi_output = dev_priv->dpi_output;
+	struct panel_funcs *p_funcs;
+	struct drm_device *dev;
+
+	if (!dsi_config || !dpi_output) {
+		if (!dsi_config)
+			DRM_INFO("%s: dsi_config NULL\n", __func__);
+		else if (!dpi_output)
+			DRM_INFO("%s: dpi_output NULL\n", __func__);
+		return;
+	}
+
+	dev = dsi_config->dev;
+
+	/*disable ESD when HDMI connected*/
+	if (hdmi_state) {
+		DRM_INFO("%s: hdmi_state %d\n", __func__, hdmi_state);
+		return;
+	}
+
+	DRM_INFO("[DISPLAY] [DDS] %s: Enter\n", __func__);
+
+	mutex_lock(&dsi_config->context_lock);
+
+	if((panel_turn_on == DDS_NONE)||(dsi_config->dsi_hw_context.panel_on==0)){
+		DRM_INFO("[DISPLAY] [DDS] %s:  panel_turn_on=%d , panel_on=%d, skip reset.\n",
+							__func__, panel_turn_on, dsi_config->dsi_hw_context.panel_on);
+		mutex_unlock(&dsi_config->context_lock);
+		return;
+	}
+
+	PSB_DEBUG_ENTRY("\n");
+
+	p_funcs = dpi_output->p_funcs;
+	if (!p_funcs) {
+		DRM_ERROR("%s: invalid panel function table\n", __func__);
+		mutex_unlock(&dsi_config->context_lock);
+		return;
+	}
+
+	if (dev_priv->pvr_screen_event_handler)
+		dev_priv->pvr_screen_event_handler(dev, 0);
+
+	if (__dpi_panel_power_off(dsi_config, p_funcs)) {
+		DRM_INFO("%s: off failed\n", __func__);
+		//mutex_unlock(&dsi_config->context_lock);
+		//return;
+	}
+
+	acquire_ospm_lock();
+
+//	ospm_power_island_down(OSPM_DISPLAY_ISLAND);
+	ospm_suspend_display(gpDrmDevice);
+
+//	ospm_power_island_up(OSPM_DISPLAY_ISLAND);
+	ospm_resume_display(gpDrmDevice->pdev);
+
+	release_ospm_lock();
+
+	if (__dpi_panel_power_on(dsi_config, p_funcs)) {
+		DRM_INFO("%s: on failed\n", __func__);
+		//psb_enable_vblank(dev, 0);
+		//mutex_unlock(&dsi_config->context_lock);
+		//return;
+	}
+
+	if (dev_priv->pvr_screen_event_handler)
+		dev_priv->pvr_screen_event_handler(dev, 1);
+
+	mutex_unlock(&dsi_config->context_lock);
+	//leve1_cnt = 0;
+	//vsync_timeout_cnt = 0;
+	DRM_INFO("%s: End panel reset\n", __func__);
+}
+#endif
+
+#ifdef CONFIG_SUPPORT_MIPI_HX8379A_DISPLAY
+void mdfld_reset_same_dpi_panel_work(struct work_struct *work)
+{
+	struct drm_psb_private *dev_priv =
+		container_of(work, struct drm_psb_private, reset_panel_work);
+
+	struct mdfld_dsi_config *dsi_config = dev_priv->dsi_configs[0];
+	struct mdfld_dsi_dpi_output *dpi_output = dev_priv->dpi_output;
+	struct panel_funcs *p_funcs;
+	struct drm_device *dev;
+
+	if (!dsi_config || !dpi_output) {
+		if (!dsi_config)
+			DRM_INFO("%s: dsi_config NULL\n", __func__);
+		else if (!dpi_output)
+			DRM_INFO("%s: dpi_output NULL\n", __func__);
+		return;
+	}
+
+	dev = dsi_config->dev;
+
+	/*disable ESD when HDMI connected*/
+	if (hdmi_state) {
+		DRM_INFO("%s: hdmi_state %d\n", __func__, hdmi_state);
+		return;
+	}
+
+	DRM_INFO("[DISPLAY] [DDS] %s: Enter\n", __func__);
+
+	mutex_lock(&dsi_config->context_lock);
+
+	PSB_DEBUG_ENTRY("\n");
+
+	p_funcs = dpi_output->p_funcs;
+	if (!p_funcs) {
+		DRM_ERROR("%s: invalid panel function table\n", __func__);
+		mutex_unlock(&dsi_config->context_lock);
+		return;
+	}
+
+	if (p_funcs->set_brightness(dsi_config, 0))
+		DRM_ERROR("Failed to set panel brightness\n");
+
+	msleep(100);
+
+	if (dev_priv->pvr_screen_event_handler)
+		dev_priv->pvr_screen_event_handler(dev, 0);
+
+	if (__dpi_panel_power_off(dsi_config, p_funcs)) {
+		DRM_INFO("%s: off failed\n", __func__);
+		//mutex_unlock(&dsi_config->context_lock);
+		//return;
+	}
+
+	acquire_ospm_lock();
+
+//	ospm_power_island_down(OSPM_DISPLAY_ISLAND);
+	ospm_suspend_display(gpDrmDevice);
+
+//	ospm_power_island_up(OSPM_DISPLAY_ISLAND);
+	ospm_resume_display(gpDrmDevice->pdev);
+
+	release_ospm_lock();
+
+	if (__dpi_panel_power_on(dsi_config, p_funcs)) {
+		DRM_INFO("%s: on failed\n", __func__);
+		//psb_enable_vblank(dev, 0);
+		//mutex_unlock(&dsi_config->context_lock);
+		//return;
+	}
+
+	if (dev_priv->pvr_screen_event_handler)
+		dev_priv->pvr_screen_event_handler(dev, 1);
+
+	mutex_unlock(&dsi_config->context_lock);
+	//leve1_cnt = 0;
+	//vsync_timeout_cnt = 0;
+	DRM_INFO("%s: End panel reset\n", __func__);
+}
+
+#endif
+
 
 /**
  * Setup Display Controller to turn on/off a video mode panel.
@@ -614,8 +1381,13 @@ static int __mdfld_dsi_dpi_set_power(struct drm_encoder *encoder, bool on)
 		return -EINVAL;
 	}
 
+#ifdef CONFIG_SUPPORT_DDS_MIPI_SWITCH
+	DRM_INFO("[DISPLAY][DDS] %s: panel_id = %d, panel_turn_on = %d\n", __func__, panel_id, panel_turn_on);
+	DRM_INFO("[DISPLAY][DDS] mdfld_dsi_dpi_set_power: set power %s on pipe %d\n", on ? "On" : "Off", pipe);
+#else
 	PSB_DEBUG_ENTRY("%s, last_ospm_suspend = %s\n", (on ? "on" : "off"),
 			(last_ospm_suspend ? "true" : "false"));
+#endif
 
 	dsi_encoder = MDFLD_DSI_ENCODER(encoder);
 	dpi_output = MDFLD_DSI_DPI_OUTPUT(dsi_encoder);
@@ -643,6 +1415,13 @@ static int __mdfld_dsi_dpi_set_power(struct drm_encoder *encoder, bool on)
 		if (Check_fw_initilized_reusable(dsi_config, p_funcs)) {
 			DRM_INFO("skip panle power setting for first boot!"
 					" panel is already powered on\n");
+
+#ifdef CONFIG_SUPPORT_MIPI_HX8379A_DISPLAY
+			if (on)
+				mdfld_dsi_error_detector_wakeup(dsi_connector);
+
+#endif
+
 			goto fun_exit;
 		} else
 			dsi_config->dsi_hw_context.panel_on = 0;
@@ -656,6 +1435,9 @@ static int __mdfld_dsi_dpi_set_power(struct drm_encoder *encoder, bool on)
 
 	switch (on) {
 	case true:
+#if defined(CONFIG_SUPPORT_MIPI_OTM8018B_DISPLAY)||defined(CONFIG_SUPPORT_MIPI_HX8379A_DISPLAY)||defined(CONFIG_SUPPORT_A450CG_MIPI_OTM8018B_DISPLAY)
+		esd_thread_enable = true;
+#endif
 		/* panel is already on */
 		if (dsi_config->dsi_hw_context.panel_on)
 			goto fun_exit;
@@ -671,16 +1453,41 @@ static int __mdfld_dsi_dpi_set_power(struct drm_encoder *encoder, bool on)
 				goto set_power_err;
 			}
 		}
-		/**
-		 * If power on, turn off color mode by default,
-		 * let panel in full color mode
-		 */
-		mdfld_dsi_dpi_set_color_mode(dsi_config, false);
-
+#ifdef CONFIG_SUPPORT_MIPI_OTM8018B_DISPLAY
+		//don't care color mode
+#elif CONFIG_SUPPORT_MIPI_HX8379A_DISPLAY
+		//don't care color mode
+#elif CONFIG_SUPPORT_A450CG_MIPI_OTM8018B_DISPLAY
+		//don't care color mode
+#elif CONFIG_SUPPORT_MIPI_SN65DSI86_BRIDGE
+		//don't care color mode
+		usleep_range(20000, 20000);
+#else
+		if (!strncmp("NT35521", dev_priv->panel_info.name, 7)){
+		    //NT35521 don't care color mode
+		    ;
+		}
+		else{
+		    /**
+		     * If power on, turn off color mode by default,
+		     * let panel in full color mode
+		     */
+		    mdfld_dsi_dpi_set_color_mode(dsi_config, false);
+		}
+#endif
 		dsi_config->dsi_hw_context.panel_on = 1;
+
+#ifdef  CONFIG_SUPPORT_MIPI_HX8379A_DISPLAY
+		mdfld_dsi_error_detector_wakeup(dsi_connector);
+#endif
+
 		last_ospm_suspend = false;
 		break;
 	case false:
+#ifdef CONFIG_SUPPORT_MIPI_HX8379A_DISPLAY
+		esd_thread_enable = false;
+		msleep(10);
+#endif
 		if (dev_priv->dpms_on_off &&
 				dsi_config->dsi_hw_context.panel_on) {
 			if (mdfld_dsi_dpi_panel_shut_down(dsi_config, p_funcs))
@@ -703,9 +1510,11 @@ static int __mdfld_dsi_dpi_set_power(struct drm_encoder *encoder, bool on)
 
 fun_exit:
 	mutex_unlock(&dsi_config->context_lock);
+#ifdef CONFIG_SUPPORT_HDMI
 	/*To optimize dpms with context lock, move panel sleep out of mutex*/
 	if (dev_priv->dpms_on_off)
 		msleep(100);
+#endif
 	PSB_DEBUG_ENTRY("successfully\n");
 	return 0;
 set_power_err:
@@ -726,7 +1535,12 @@ void mdfld_dsi_dpi_set_power(struct drm_encoder *encoder, bool on)
 	u32 mipi_reg = MIPI;
 	u32 pipeconf_reg = PIPEACONF;
 
+#ifdef CONFIG_SUPPORT_DDS_MIPI_SWITCH
+	DRM_INFO("[DISPLAY][DDS] %s: panel_id = %d, panel_turn_on = %d\n", __func__, panel_id, panel_turn_on);
+	DRM_INFO("[DISPLAY][DDS] mdfld_dsi_dpi_set_power: set power %s on pipe %d\n", on ? "On" : "Off", pipe);
+#else
 	PSB_DEBUG_ENTRY("set power %s on pipe %d\n", on ? "On" : "Off", pipe);
+#endif
 
 	dpi_output = MDFLD_DSI_DPI_OUTPUT(dsi_encoder);
 

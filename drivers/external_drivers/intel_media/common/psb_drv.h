@@ -85,7 +85,7 @@ enum {
 };
 #endif
 //ASUS_BSP: Louis ---
-#ifdef CONFIG_SUPPORT_OTM8018B_MIPI_480X854_DISPLAY
+#if defined(CONFIG_SUPPORT_OTM8018B_MIPI_480X854_DISPLAY)||defined(CONFIG_SUPPORT_MIPI_HX8379A_DISPLAY)
 extern bool esd_thread_enable;
 #endif
 
